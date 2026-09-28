@@ -1,0 +1,82 @@
+name: Build xpple/cubiomes
+
+on:
+  # 仅手动触发
+  workflow_dispatch:
+    inputs:
+      cubiomes_ref:
+        description: 'xpple/cubiomes 的分支或 commit(默认 master)'
+        required: false
+        default: 'master'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 检出当前分支（你选择在哪个分支运行，就检出哪个）
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 安装构建依赖
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc g++ make
+
+      # 3. 克隆 xpple/cubiomes 最新源码
+      - name: Clone xpple/cubiomes
+        run: |
+          git clone --depth 1 --branch ${{ inputs.cubiomes_ref }} \
+            https://github.com/xpple/cubiomes.git cubiomes
+
+      # 3.5 上游 xpple/cubiomes 的 CMakeLists 里 SHARED 目标没有链接 libm，
+      #     产物 libcubiomes.so 因此缺少 DT_NEEDED libm.so.6，
+      #     运行时会报 "undefined symbol: sincos"（以及 sin/pow/sqrt/erf...）。
+      #     这里给共享库补上 -lm；--no-as-needed 防止它被链接器当成无用库丢弃。
+      - name: Link libm into shared library
+        working-directory: cubiomes
+        run: |
+          printf '\ntarget_link_options(cubiomes PRIVATE -Wl,--no-as-needed -lm)\n' >> CMakeLists.txt
+          tail -3 CMakeLists.txt
+
+      # 4. 编译共享库（libcubiomes.so）
+      - name: Build shared library
+        working-directory: cubiomes
+        run: |
+          mkdir -p build-shared && cd build-shared
+          cmake .. -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build . -- -j$(nproc)
+
+      # 5. 编译静态库（libcubiomes.a）
+      - name: Build static library
+        working-directory: cubiomes
+        run: |
+          mkdir -p build-static && cd build-static
+          cmake .. -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build . -- -j$(nproc)
+
+      # 6. 整理产物到统一目录
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts/include
+          # 共享库
+          find cubiomes/build-shared -name 'libcubiomes.so*' -exec cp {} artifacts/ \;
+          # 静态库
+          find cubiomes/build-static -name 'libcubiomes.a' -exec cp {} artifacts/ \;
+          # 头文件(FFI 绑定需要)
+          cp cubiomes/*.h artifacts/include/ 2>/dev/null || true
+          # 记录版本信息
+          cd cubiomes && git rev-parse HEAD > ../artifacts/CUBIOMES_COMMIT.txt
+          cd ..
+          echo "Ref: ${{ inputs.cubiomes_ref }}" >> artifacts/CUBIOMES_COMMIT.txt
+          echo "Build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> artifacts/CUBIOMES_COMMIT.txt
+
+      # 7. 上传为 GitHub Actions Artifact
+      - name: Upload cubiomes artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cubiomes-linux-x64-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 90
